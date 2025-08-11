@@ -5,7 +5,7 @@ from scipy import signal
 
 def memory_capacity(n_trials=None, horizon_max=-20, win=30, 
                    low=-1,high=1,input_gain=None,add_bias=False,
-                   seed=None, **kwargs):
+                   seed=None, restrict_range = None, **kwargs):
     """
         Fetch data for MemoryCapacity, which is defined as a multi-output
         task using a uniformly distributed input signal and multiple
@@ -88,6 +88,14 @@ def memory_capacity(n_trials=None, horizon_max=-20, win=30,
         x = x[:, np.newaxis]
     if y.ndim == 1:
         y = y[:, np.newaxis]
+
+    if restrict_range is not None:
+        x[x > 0] += restrict_range
+        x[x < 0] += -restrict_range
+        y[y > 0] += restrict_range
+        y[y < 0] += -restrict_range
+        z[z > 0] += restrict_range
+        z[z < 0] += -restrict_range
 
     # scale input data
     if input_gain is not None:
