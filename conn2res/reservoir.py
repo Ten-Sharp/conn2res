@@ -1540,7 +1540,7 @@ class MemristiveReservoirCupy(ABC):
 
     """
 
-    def __init__(self, w, int_nodes, ext_nodes, gr_nodes, save_conductance=False, save_dissipated=False ,save_voltage=False,*args, **kwargs):
+    def __init__(self, w, int_nodes, ext_nodes, gr_nodes, save_conductance=False, save_dissipated=False ,save_voltage=False, weighted = False,*args, **kwargs):
         """
         Constructor class for Memristive Networks. Memristive networks are an
         abstraction for physical networks of memristive elements.
@@ -1570,6 +1570,11 @@ class MemristiveReservoirCupy(ABC):
             This will increase memory demands. Default: False
         """
         #setW now returns a CuPy array
+        self.weighted = weighted
+        self._Weights = None
+        if len(np.unique(w)) > 2 and weighted:
+            self._Weights = w
+
         self._W = self.setW(w)
         #moves all of the arrays to the Device (GPU)
         self._I = cp.asarray(int_nodes)
@@ -1657,12 +1662,13 @@ class MemristiveReservoirCupy(ABC):
             (N,N) Matrix of size W of random values drawn from Gaussian using mean=mean and std=0.1
 
         """
-
+        print(f'INIT MEAN AND STD: {mean}, {std}')
         # use random number generator for reproducibility
         rng = np.random.default_rng(seed=seed)
 
         p = cp.asarray(rng.normal(mean, std*mean, size=self._W.shape))
         p = utils.make_symmetric(p)
+        print(f'P MIN: {cp.min(p)}')
 
         return cp.multiply(p , self._W).astype(cp.float64)  # ma.masked_array(p, mask=np.logical_not(self._W))   
 
@@ -2062,7 +2068,7 @@ class MSSNetworkCupy(MemristiveReservoirCupy):
     VT = 1.0/b
 
     def __init__(self, vA=0.17, vB=0.22, tc=0.32e-3, NMSS=1000000,
-                 Woff=0.91e-3, Won=0.87e-2, Nb=200000, noise=0.1, *args, **kwargs):
+                 Woff=0.91e-3, Won=0.87e-2, Nb=200000, noise=0.1, noisy=False,*args, **kwargs):
         """
         Constructor class for Memristive Networks following the Generalized
         Memristive Switch Model proposed in Nugent and Molter, 2014. Default
@@ -2130,8 +2136,11 @@ class MSSNetworkCupy(MemristiveReservoirCupy):
         self.vA = self.mask(cp.full(self._W.shape,vA))
         self.vB = self.mask(cp.full(self._W.shape,vB))
         self.tc = self.mask(cp.full(self._W.shape,tc))
-        # self.NMSS = cp.round(self.init_property(NMSS, noise)).astype(cp.float64)    # constant Note: This sets a different number of switches per memristor 
-        self.NMSS = self.mask(cp.full(self._W.shape,NMSS))
+        if noisy:
+            print('initializing Noisy')
+            self.NMSS = cp.round(self.init_property(NMSS, noise)).astype(cp.float64) # constant Note: This sets a different number of switches per memristor 
+        else:
+            self.NMSS = self.mask(cp.full(self._W.shape,NMSS))
         # self.Woff = self.init_property(Woff, noise)    # constant
         # self.Won = self.init_property(Won, noise)     # constant
         self.Woff = self.mask(cp.full(self._W.shape,Woff))    # constant
@@ -2140,8 +2149,25 @@ class MSSNetworkCupy(MemristiveReservoirCupy):
         self._Gb = self.mask(cp.divide(self.Won,self.NMSS))   # constant
 
         # self._Nb = cp.round(self.init_property(Nb, noise)).astype(cp.float64)
-        self._Nb = (cp.asarray(np.random.default_rng().uniform(low=0.1,high=0.9,size=self._W.shape)) * self.NMSS).astype(int).astype(cp.float64)
+        if self.weighted:
+            self._Nb = (self.weighted_Nb(w=self._Weights) * self.NMSS).astype(int).astype(cp.float64)
+        else:
+            self._Nb = (cp.asarray(np.random.default_rng().uniform(low=0.1,high=0.9,size=self._W.shape)) * self.NMSS).astype(int).astype(cp.float64)
         self._G = cp.asarray(self._Nb * (self._Gb - self._Ga) + self.NMSS * self._Ga)
+
+    def weighted_Nb(self,w):
+        weights = cp.unique(w)
+        weights = weights[weights != 0.0]
+
+        numerators = cp.exp(weights)
+        denom = cp.sum(cp.exp(weights))
+        soft = numerators/denom
+
+        soft_W = cp.zeros_like(w)
+        for i, val in enumerate(weights):
+            soft_W[cp.where(w==val)] = soft[i]
+
+        return soft_W
 
     #Note: dt was prev 1e-4 changed to match AgChalc Memristor 
     def dG(self, V, G=None, dt=1e-4, seed=None):
