@@ -12,6 +12,9 @@ import cupy as cp
 from joblib import Parallel, delayed
 from abc import ABC,abstractmethod
 from joblib import Parallel, delayed
+# from MemTorch import memtorch
+from memtorch.bh.memristor import LinearIonDrift,Memristor
+
 
 class Reservoir(metaclass=ABCMeta):
     """
@@ -1123,7 +1126,7 @@ class MemristiveReservoir(ABC):
         #removes voltage values from V in positions where there is no connection in W 
         return self.mask(V)
 
-    def simulate(self, Vext, ic=None, mode='forward'):
+    def simulate(self, Vext, ic=None, mode='forward', ret_int_only = False):
         """
         Simulates the dynamics of a memristive reservoir given an external
         voltage signal V_E
@@ -1197,6 +1200,9 @@ class MemristiveReservoir(ABC):
             # store conductance
             if self.save_conductance:
                 self._G_history[t] = self._G
+
+        if ret_int_only: 
+            return self._state[:,self._I]
 
         #self._state is a (t x N_nodes) matrix which keeps track of node voltage across time
         #self._state is a (t x N_nodes) matrix which keeps track of node voltage across time
@@ -1540,7 +1546,7 @@ class MemristiveReservoirCupy(ABC):
 
     """
 
-    def __init__(self, w, int_nodes, ext_nodes, gr_nodes, save_conductance=False, save_dissipated=False ,save_voltage=False,*args, **kwargs):
+    def __init__(self, w, int_nodes, ext_nodes, gr_nodes, save_conductance=False, save_dissipated=False ,save_voltage=False, weighted = False,*args, **kwargs):
         """
         Constructor class for Memristive Networks. Memristive networks are an
         abstraction for physical networks of memristive elements.
@@ -1570,6 +1576,11 @@ class MemristiveReservoirCupy(ABC):
             This will increase memory demands. Default: False
         """
         #setW now returns a CuPy array
+        self.weighted = weighted
+        self._Weights = None
+        if len(np.unique(w)) > 2 and weighted:
+            self._Weights = w
+
         self._W = self.setW(w)
         #moves all of the arrays to the Device (GPU)
         self._I = cp.asarray(int_nodes)
@@ -1657,12 +1668,13 @@ class MemristiveReservoirCupy(ABC):
             (N,N) Matrix of size W of random values drawn from Gaussian using mean=mean and std=0.1
 
         """
-
+        print(f'INIT MEAN AND STD: {mean}, {std}')
         # use random number generator for reproducibility
         rng = np.random.default_rng(seed=seed)
 
         p = cp.asarray(rng.normal(mean, std*mean, size=self._W.shape))
         p = utils.make_symmetric(p)
+        print(f'P MIN: {cp.min(p)}')
 
         return cp.multiply(p , self._W).astype(cp.float64)  # ma.masked_array(p, mask=np.logical_not(self._W))   
 
@@ -2062,7 +2074,7 @@ class MSSNetworkCupy(MemristiveReservoirCupy):
     VT = 1.0/b
 
     def __init__(self, vA=0.17, vB=0.22, tc=0.32e-3, NMSS=1000000,
-                 Woff=0.91e-3, Won=0.87e-2, Nb=200000, noise=0.1, *args, **kwargs):
+                 Woff=0.91e-3, Won=0.87e-2, Nb=200000, noise=0.1, noisy=False,*args, **kwargs):
         """
         Constructor class for Memristive Networks following the Generalized
         Memristive Switch Model proposed in Nugent and Molter, 2014. Default
@@ -2130,8 +2142,11 @@ class MSSNetworkCupy(MemristiveReservoirCupy):
         self.vA = self.mask(cp.full(self._W.shape,vA))
         self.vB = self.mask(cp.full(self._W.shape,vB))
         self.tc = self.mask(cp.full(self._W.shape,tc))
-        # self.NMSS = cp.round(self.init_property(NMSS, noise)).astype(cp.float64)    # constant Note: This sets a different number of switches per memristor 
-        self.NMSS = self.mask(cp.full(self._W.shape,NMSS))
+        if noisy:
+            print('initializing Noisy')
+            self.NMSS = cp.round(self.init_property(NMSS, noise)).astype(cp.float64) # constant Note: This sets a different number of switches per memristor 
+        else:
+            self.NMSS = self.mask(cp.full(self._W.shape,NMSS))
         # self.Woff = self.init_property(Woff, noise)    # constant
         # self.Won = self.init_property(Won, noise)     # constant
         self.Woff = self.mask(cp.full(self._W.shape,Woff))    # constant
@@ -2140,8 +2155,25 @@ class MSSNetworkCupy(MemristiveReservoirCupy):
         self._Gb = self.mask(cp.divide(self.Won,self.NMSS))   # constant
 
         # self._Nb = cp.round(self.init_property(Nb, noise)).astype(cp.float64)
-        self._Nb = (cp.asarray(np.random.default_rng().uniform(low=0.1,high=0.9,size=self._W.shape)) * self.NMSS).astype(int).astype(cp.float64)
+        if self.weighted:
+            self._Nb = (self.weighted_Nb(w=self._Weights) * self.NMSS).astype(int).astype(cp.float64)
+        else:
+            self._Nb = (cp.asarray(np.random.default_rng().uniform(low=0.1,high=0.9,size=self._W.shape)) * self.NMSS).astype(int).astype(cp.float64)
         self._G = cp.asarray(self._Nb * (self._Gb - self._Ga) + self.NMSS * self._Ga)
+
+    def weighted_Nb(self,w):
+        weights = cp.unique(w)
+        weights = weights[weights != 0.0]
+
+        numerators = cp.exp(weights)
+        denom = cp.sum(cp.exp(weights))
+        soft = numerators/denom
+
+        soft_W = cp.zeros_like(w)
+        for i, val in enumerate(weights):
+            soft_W[cp.where(w==val)] = soft[i]
+
+        return soft_W
 
     #Note: dt was prev 1e-4 changed to match AgChalc Memristor 
     def dG(self, V, G=None, dt=1e-4, seed=None):
@@ -2697,3 +2729,274 @@ def reservoir(name, **kwargs):
         return EchoStateNetwork(**kwargs)
     if name == 'MSSNetwork':
         return MSSNetwork(**kwargs)
+
+class MemtorchNetwork(MemristiveReservoir):
+    """
+    Class that represents a Metastable Switch Memristive network
+    (see Nugent and Molter, 2014 for details)
+
+    ...
+
+    Attributes
+    ----------
+    w : numpy.ndarray
+        reservoir's binary connectivity matrix
+    I : numpy.ndarray
+        indices of internal nodes
+    E : numpy.ndarray
+        indices of external nodes
+    GR : numpy.ndarray
+        indices of grounded nodes
+    n_internal_nodes : int
+        number of internal nodes
+    n_external_nodes : int
+        number of external nodes
+    n_grounded_nodes : int
+        number of gorunded nodes
+    n_nodes : int
+        total number of nodes (internal, external, and ground)
+    G : numpy.ndarray
+        matrix of conductances
+    save_conductance : bool
+        Indicates whether to save conductance state after each simulation
+        step. If True, then will be stored in self._G_history. This will
+        increase memory demands.
+    vA : numpy.ndarray of floats
+
+    vB : numpy.ndarray of floats
+
+    tc : numpy.ndarray of floats
+
+    NMSS : numpy.ndarray of ints
+
+    Woff : numpy.ndarray of floats
+
+    Won : numpy.ndarray of floats
+
+    Ga : numpy.ndarray of floats
+
+    Gb : numpy.ndarray of floats
+
+    Nb : numpy.ndarray of ints
+
+
+    Methods
+    ----------
+    # TODO
+
+    """
+
+    # physical parameters of the MMS model
+    k = 1.3806503e-23   # Boltzman's constant
+    Q = 1.60217646e-19  # electron charge
+    Temp = 298.0          # temperature
+    b = Q/(k*Temp)
+    VT = 1.0/b
+    
+
+    def __init__(self, memristor:Memristor, noisy=False,*args, **kwargs):
+        """
+        Constructor class for Memristive Networks following the Generalized
+        Memristive Switch Model proposed in Nugent and Molter, 2014. Default
+        parameter values correspond to an Ag-chalcogenide memristive device
+        taken from Nugent and Molter, 2014.
+
+        Parameters
+        ----------
+        w : (N, N) numpy.ndarray
+            reservoir's binary connectivity matrix
+            N: total number of nodes in the network (internal + external
+            + grounded nodes)
+        int_nodes : (n_internal_nodes,) numpy.ndarray
+            indexes of internal nodes
+            n_internal_nodes: number of internal nodes
+        ext_nodes : (n_external_nodes,) numpy.ndarray
+            indexes of external nodes
+            n_external_nodes: number of external nodes
+        gr_nodes : (n_grounded_nodes,) numpy.ndarray
+            indexes of grounded nodes
+            n_grounded_nodes: number of grounded nodes
+        save_conductance : bool, optional
+            Indicates whether to save conductance state after each simulation
+            step. If True, then will be stored in self._G_history. This will
+            increase memory demands. Default: False
+
+        vA : float. Default: 0.17
+            vA controls the voltage needed for metastable switch(es) to transition
+            from B state to A state
+
+        vB : float. Default: 0.22
+            vB controls the voltage needed for metastable switch(es) to transition
+            from A state to B state
+
+        tc : float. Default: 0.32e-3
+
+        NMSS : int. Default: 10000
+            Number of Metastable switches switches per memristor
+                - More switches means memristor is more sensitive to change
+
+        Woff : float. Default: 0.91e-3
+            Minimum conductance of memristor
+
+        Won : float. Default: 0.87e-2
+            Maximum conductance of memristor
+
+        Nb : int. Default: 2000
+            Note: Nb values changed to be uniform * NMSS, since having
+            normally distributed values for Nb around mean 2000000 made it so
+            that with any voltage passed, Nb for each memristor was consistently
+            increasing at each iteration. i.e original starting Nb was too low for
+            NMSS 
+
+        noise : float. Default: 0.1
+
+        # TODO
+        """
+        super().__init__(*args, **kwargs)
+        #NOTE: init_property initializes properties from normal distribution vs mask initializes constants
+
+        random_values = np.random.uniform(memristor.r_off,memristor.r_on, size=self._W.shape)
+
+        # Multiply element-wise to keep only non-zero entries
+        self._G = random_values * (self._W != 0)
+
+        self.memristor = memristor
+
+    def weighted_Nb(self,w):
+        weights = cp.unique(w)
+        weights = weights[weights != 0.0]
+
+        numerators = cp.exp(weights)
+        denom = cp.sum(cp.exp(weights))
+        soft = numerators/denom
+
+        soft_W = cp.zeros_like(w)
+        for i, val in enumerate(weights):
+            soft_W[cp.where(w==val)] = soft[i]
+
+        return soft_W
+
+    #Note: dt was prev 1e-4 changed to match AgChalc Memristor 
+    def dG(self, V, G=None, dt=1e-4, seed=None):
+        """
+        # TODO
+        This function updates the conductance matrix G given V.
+        G represents the conductance for each memristor in the network
+        (One per connection in W)
+
+        Parameters
+        ----------
+        V : (N,N) cupy.ndarray
+            matrix of voltages accross memristors
+        G : (N,N) cupy.ndarray
+            Matrix of conductances across each memristor in the network
+        seed : int, array_like[ints], SeedSequence, BitGenerator, Generator, optional
+            seed to initialize the random number generator, by default None
+            for details, see numpy.random.default_rng()
+
+        Returns
+        -------
+        dNb : cupy.ndarray
+            Matrix representing the number of switches change to or from 
+            B state per memristor in the network.
+            (+ more switches changed to B state,  - More switches changed to A state)
+
+        References
+        ----------
+
+        """
+
+        # set Nb values
+        if G is not None:
+            Gdiff1 = G - self.NMSS * self._Ga
+            Gdiff2 = self._Gb - self._Ga
+            Nb = self.mask(cp.divide(Gdiff1,Gdiff2))
+
+        else:
+            Nb = self._Nb
+
+        tc_np = self.tc.get()
+        # ratio of dt to characterictic time of the device tc
+        alpha = cp.asarray(np.divide(dt, tc_np, where=tc_np != 0))
+
+        # compute Pa
+        exponent = -1 * (V - self.vA) / self.VT
+        Pa = alpha / (1 + cp.exp(exponent))
+        # compute Pb
+        exponent = -1 * (V + self.vB) / self.VT
+        Pb = alpha * (1 - (1 / (1 + cp.exp(exponent))))
+        # compute dNb
+        Na = self.NMSS - Nb
+        Na = cp.asnumpy(Na)
+        Nb = cp.asnumpy(Nb)
+        # use random number generator for reproducibility
+        rng = np.random.default_rng(seed=seed)
+        
+        Pa[cp.isnan(Pa)] = 0.0
+        Pb[cp.isnan(Pb)] = 0.0
+        Pa = cp.clip(Pa, 0.0, 1.0)
+        Pb = cp.clip(Pb, 0.0, 1.0)
+
+        #calculates number of switches that switch states in each memristor
+        #state A to B
+        Gab = cp.asarray(rng.binomial(Na.astype(int), Pa.get()))
+        #state B to A
+        Gba = cp.asarray(rng.binomial(Nb.astype(int), Pb.get()))
+
+        if utils.check_symmetric(self._W):
+            Gab = utils.make_symmetric(Gab)
+            Gba = utils.make_symmetric(Gba)
+
+        #finds the change in number of B state switches in each memristor
+        dNb = (Gab-Gba).astype(cp.float64)
+
+        return dNb
+
+    def updateG(self, V, G=None, update=False):
+        """
+        This function updates the conductance matrix G
+        which represents the conductance across each memristor in
+        the network. Does this according to the change in number
+        of B state switches in each memristor
+
+        Parameters
+        ----------
+        V : (N,N) cupy.ndarray
+            Matrix of voltages across all memristors in the network
+        G : (N,N) cupy.ndarray
+            Matrix of conductance across each memristor (connection)
+            in the network
+            Deafault: None
+        update: boolean
+            Boolean flag of whether the current conductance matrix should be 
+            updated according to the calculated change of conductance or not
+
+        Returns
+        -------
+        G + dG : (N,N) cupy.ndarray
+            returns a copy of the updated conducatance matrix if the update
+            flag is false
+        """
+
+        if G is None:
+            G = self._G
+
+        lower_idx = np.tril_indices_from(G,k=-1)
+        non_zero = G[lower_idx] != 0
+        rows = lower_idx[0][non_zero]
+        cols = lower_idx[1][non_zero]
+
+        for r,c in zip(rows,cols):
+            base_G = G[r,c]
+            self.memristor.set_conductance(base_G)
+            self.memristor.simulate(V[r,c])
+            G[r,c] = self.memristor.g
+        # compute dG
+        G = np.tril(G)
+        G = G + G.T - np.diag(np.diag(G))
+
+        if update:
+            self._G = G
+
+        else:
+            return G  # updated conductance
